@@ -124,7 +124,7 @@ static NSMutableDictionary* _typingNotifications;
     }
     
     //ignore messages from our own device, see this github issue: https://github.com/monal-im/Monal/issues/941
-    if(![messageNode check:@"/<type=groupchat>"] && !isMLhistory && [messageNode.from isEqualToString:account.connectionProperties.identity.fullJid] && [messageNode.toUser isEqualToString:account.connectionProperties.identity.jid])
+    if(!isMLhistory && [messageNode.from isEqualToString:account.connectionProperties.identity.fullJid] && [messageNode.toUser isEqualToString:account.connectionProperties.identity.jid])
         return nil;
 
     //handle incoming jmi calls (TODO: add entry to local history, once the UI for this is implemented)
@@ -207,8 +207,10 @@ static NSMutableDictionary* _typingNotifications;
     
     //ignore muc PMs (after discussion with holger we don't want to support that)
     if(
-        ![messageNode check:@"/<type=groupchat>"] && [messageNode check:@"{http://jabber.org/protocol/muc#user}x"] &&
-        ![messageNode check:@"{http://jabber.org/protocol/muc#user}x/invite"] && [messageNode check:@"body#"]
+        ![messageNode check:@"/<type=groupchat>"] &&
+        ([messageNode check:@"{http://jabber.org/protocol/muc#user}x"] || messageNode.fromResource != nil) &&
+        ![messageNode check:@"{http://jabber.org/protocol/muc#user}x/invite"] &&
+        [messageNode check:@"body#"]
     )
     {
         DDLogWarn(@"Ignoring muc pm marked as such...");
@@ -242,7 +244,8 @@ static NSMutableDictionary* _typingNotifications;
             DDLogVerbose(@"Not a carbon copy of a muc pm for contact: %@", carbonTestContact);
     }
     
-    if(([messageNode check:@"/<type=groupchat>"] || [messageNode check:@"{http://jabber.org/protocol/muc#user}x"]) && ![messageNode check:@"{http://jabber.org/protocol/muc#user}x/invite"])
+    
+    if((possiblyUnknownContact.isMuc || [messageNode check:@"{http://jabber.org/protocol/muc#user}x"]) && ![messageNode check:@"{http://jabber.org/protocol/muc#user}x/invite"])
     {
         // Ignore all group chat msgs from unkown groups
         if(![[[DataLayer sharedInstance] listMucsForAccount:account.accountNo] containsObject:messageNode.fromUser])
@@ -272,9 +275,9 @@ static NSMutableDictionary* _typingNotifications;
     //check stanza-id @by according to the rules outlined in XEP-0359
     if(!stanzaid)
     {
-        if(![messageNode check:@"/<type=groupchat>"] && [messageNode check:@"{urn:xmpp:sid:0}stanza-id<by=%@>", account.connectionProperties.identity.jid])
+        if(!possiblyUnknownContact.isMuc && [messageNode check:@"{urn:xmpp:sid:0}stanza-id<by=%@>", account.connectionProperties.identity.jid])
             stanzaid = [messageNode findFirst:@"{urn:xmpp:sid:0}stanza-id<by=%@>@id", account.connectionProperties.identity.jid];
-        else if([messageNode check:@"/<type=groupchat>"] && [messageNode check:@"{urn:xmpp:sid:0}stanza-id<by=%@>", messageNode.fromUser] && [[account.mucProcessor getRoomFeaturesForMuc:messageNode.fromUser] containsObject:@"urn:xmpp:sid:0"])
+        else if(possiblyUnknownContact.isMuc && [messageNode check:@"{urn:xmpp:sid:0}stanza-id<by=%@>", messageNode.fromUser] && [[account.mucProcessor getRoomFeaturesForMuc:messageNode.fromUser] containsObject:@"urn:xmpp:sid:0"])
             stanzaid = [messageNode findFirst:@"{urn:xmpp:sid:0}stanza-id<by=%@>@id", messageNode.fromUser];
     }
     
@@ -313,15 +316,35 @@ static NSMutableDictionary* _typingNotifications;
     NSString* actualFrom = messageNode.fromUser;
     NSString* participantJid = nil;
     NSString* occupantId = nil;
-    if([messageNode check:@"/<type=groupchat>"] && messageNode.fromResource)
+    if(possiblyUnknownContact.isMuc)
     {
-        ownNick = [[DataLayer sharedInstance] ownNickNameforMuc:messageNode.fromUser forAccount:account.accountNo];
-        actualFrom = messageNode.fromResource;
+        actualFrom = messageNode.fromResource ?: @"";
+        
+        ownNick = [[DataLayer sharedInstance] ownNickNameforMuc:messageNode.fromUser forAccount:account.accountID];
+        ownOccupantId = [[DataLayer sharedInstance] getOwnOccupantIdForMuc:messageNode.fromUser onAccountID:account.accountID];
+        
+        //occupant ids are widely supported now and allow us to have a stable identifier of every muc participant,
+        //even if it is a semi-anonymous channel
+        if([[account.mucProcessor getRoomFeaturesForMuc:messageNode.fromUser] containsObject:@"urn:xmpp:occupant-id:0"] && [messageNode check:@"{urn:xmpp:occupant-id:0}occupant-id@id"])
+        {
+            occupantId = [messageNode findFirst:@"{urn:xmpp:occupant-id:0}occupant-id@id"];
+            NSDictionary* mucParticipant = [[DataLayer sharedInstance] getParticipantForOccupant:occupantId inRoom:messageNode.fromUser forAccountID:account.accountID];
+            //we will be able to get to know the real jid, if this is a group or we are the channel admin
+            participantJid = mucParticipant ? mucParticipant[@"participant_jid"] : nil;
+        }
+        
         //mam catchups will contain a muc#user item listing the jid of the participant
         //this can't be reconstructed from *current* participant lists because someone new could have taken the same nick
         //we don't accept this in non-mam context to make sure this can't be spoofed somehow
-        participantJid = [messageNode findFirst:@"/<type=groupchat>/{http://jabber.org/protocol/muc#user}x/item@jid"];
-        if(![outerMessageNode check:@"{urn:xmpp:mam:2}result"] || participantJid == nil)
+        //we also don't do that, if this was a message from the bare muc jid
+        //NOTE: this will override the participantJid extracted using the occupantId above,
+        //NOTE: but those should ALWAYS be the same (that's the exact purpose of occupant ids)
+        if([outerMessageNode check:@"{urn:xmpp:mam:2}result"] && ![@"" isEqualToString:actualFrom])
+            participantJid = [messageNode findFirst:@"{http://jabber.org/protocol/muc#user}x/item@jid"];
+        
+        //try to get the jid of the current participant if the occupant-id based approach above did not work
+        //but don't do so, if this was a message from the bare muc jid
+        if(![outerMessageNode check:@"{urn:xmpp:mam:2}result"] && occupantId == nil && participantJid == nil && ![@"" isEqualToString:actualFrom])
         {
             if([[account.mucProcessor getRoomFeaturesForMuc:messageNode.fromUser] containsObject:@"urn:xmpp:occupant-id:0"] && [messageNode check:@"{urn:xmpp:occupant-id:0}occupant-id@id"])
             {
@@ -567,6 +590,9 @@ static NSMutableDictionary* _typingNotifications;
             else if([lowercaseBody hasPrefix:@"https://"])
                 messageType = kMessageTypeUrl;
         }
+        //messages from the bare muc jid are classified as status messages
+        if(possiblyUnknownContact.isMuc && [@"" isEqualToString:actualFrom])
+            messageType = kMessageTypeStatus;
         DDLogInfo(@"Got message of type: %@", messageType);
         
         if(body)
