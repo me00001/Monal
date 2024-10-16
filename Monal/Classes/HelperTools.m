@@ -2353,7 +2353,11 @@ void swizzle(Class c, SEL orig, SEL new)
 #if TARGET_OS_MACCATALYST
     NSString* resource = [NSString stringWithFormat:@"Monal-macOS.%@", [self hexadecimalString:[NSData dataWithBytes: &i length: sizeof(i)]]];
 #else
+#if IS_QUICKSY
+    NSString* resource = [NSString stringWithFormat:@"Quicksy-iOS.%@", [self hexadecimalString:[NSData dataWithBytes: &i length: sizeof(i)]]];
+#else
     NSString* resource = [NSString stringWithFormat:@"Monal-iOS.%@", [self hexadecimalString:[NSData dataWithBytes: &i length: sizeof(i)]]];
+#endif
 #endif
     return resource;
 }
