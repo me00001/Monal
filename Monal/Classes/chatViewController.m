@@ -3560,8 +3560,7 @@ enum msgSentState {
 
 -(void) notifyUploadQueueRemoval:(NSUInteger) index
 {
-    if(index >= self.uploadQueue.count)
-        return;
+    MLAssert(index < self.uploadQueue.count, @"index is only allowed to be smaller than uploadQueue.count");
     [self.uploadMenuView performBatchUpdates:^{
         [self deleteQueueItemAtIndex:index];
     } completion:^(BOOL finished) {
