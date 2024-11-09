@@ -366,8 +366,8 @@ static NSMutableSet* _pushWarningDisplayed;
             BOOL found = NO;
             for(NSDictionary* accountDict in [[DataLayer sharedInstance] enabledAccountList])
             {
-                NSNumber* accountID = accountDict[kAccountID];
-                if([MLNotificationManager sharedInstance].currentContact.accountID.intValue == accountID.intValue)
+                NSNumber* accountId = accountDict[kAccountID];
+                if([MLNotificationManager sharedInstance].currentContact.accountId.intValue == accountId.intValue)
                     found = YES;
             }
             if(!found)
