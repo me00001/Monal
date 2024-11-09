@@ -441,8 +441,6 @@ static BOOL warnUnclean = NO;
     if(warnUnclean)
         DDLogError(@"detected unclean appex shutdown!");
     
-    [[HelperTools defaultsDB] setObject:[NSDate now] forKey:@"lastAppexStart"];
-    
     //mark this appex as unclean (will be cleared directly before calling exit(0))
     [NotificationService setAppexCleanShutdownStatus:NO];
 }
