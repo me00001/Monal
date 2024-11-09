@@ -52,7 +52,10 @@
             return;
         }
         DDLogDebug(@"Starting timer: %@", self);
-        [[HelperTools getExtraRunloopWithIdentifier:MLRunLoopIdentifierTimer] addTimer:_wrappedTimer forMode:NSRunLoopCommonModes];
+        //scheduling and unscheduling of a timer must be done from the same thread --> use our runloop
+        [self scheduleBlockInRunLoop:^{
+            [[HelperTools getExtraRunloopWithIdentifier:MLRunLoopIdentifierTimer] addTimer:self->_wrappedTimer forMode:NSRunLoopCommonModes];
+        }];
     }
 }
 
@@ -131,8 +134,28 @@
             return;
         }
         //DDLogVerbose(@"Invalidating timer: %@", self);
-        [_wrappedTimer invalidate];
+        //scheduling and unscheduling of a timer must be done from the same thread --> use our runloop
+        [self scheduleBlockInRunLoop:^{
+            [self->_wrappedTimer invalidate];
+        }];
     }
+}
+
+-(void) scheduleBlockInRunLoop:(monal_void_block_t) block
+{
+    NSRunLoop* runLoop = [HelperTools getExtraRunloopWithIdentifier:MLRunLoopIdentifierTimer];
+//     NSCondition* condition = [NSCondition new];
+//     [condition lock];
+    CFRunLoopPerformBlock([runLoop getCFRunLoop], (__bridge CFStringRef)NSDefaultRunLoopMode, ^{
+        block();
+//         [condition lock];
+//         [condition signal];
+//         [condition unlock];
+    });
+    CFRunLoopWakeUp([runLoop getCFRunLoop]);    //trigger wakeup of runloop to execute the block as soon as possible
+//     //wait for our block to finish executing
+//     [condition wait];
+//     [condition unlock];
 }
 
 @end
