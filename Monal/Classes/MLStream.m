@@ -50,7 +50,7 @@
     //(mutexes can not be unlocked in a thread different from the one it got locked in and NSLock internally uses mutext --> both can not be used)
     dispatch_semaphore_t _read_sem;
 }
-@property (atomic, readonly) void (^incoming_data_handler)(NSData* _Nullable, BOOL, NSError* _Nullable);
+@property (atomic, readonly) void (^incoming_data_handler)(NSData* _Nullable, BOOL, NSError* _Nullable, BOOL allow_next_read);
 @end
 
 @interface MLOutputStream()
@@ -89,7 +89,7 @@
     //this handler will be called by the schedule_read method
     //since the framer swallows all data, nw_connection_receive() and the framer cannot race against each other and deliver reordered data
     weakify(self);
-    _incoming_data_handler = ^(NSData* _Nullable content, BOOL is_complete, NSError* _Nullable st_error) {
+    _incoming_data_handler = ^(NSData* _Nullable content, BOOL is_complete, NSError* _Nullable st_error, BOOL allow_next_read) {
         strongify(self);
         if(self == nil)
             return;
@@ -142,7 +142,7 @@
             [self generateEvent:NSStreamEventEndEncountered];
         
         //try to read again
-        if(!is_complete && !generate_bytes_available_event)
+        if(!is_complete && !generate_bytes_available_event && allow_next_read)
             [self schedule_read];
     };
     return self;
@@ -235,7 +235,8 @@
                 DDLogDebug(@"now calling nw_framer_parse_input inside framer queue");
                 nw_framer_parse_input(self.shared_state.framer, 1, BUFFER_SIZE, nil, ^size_t(uint8_t* buffer, size_t buffer_length, bool is_complete) {
                     DDLogDebug(@"nw_framer_parse_input got callback with is_complete:%@, length=%zu", bool2str(is_complete), (unsigned long)buffer_length);
-                    self.incoming_data_handler([NSData dataWithBytes:buffer length:buffer_length], is_complete, nil);
+                    //we only want to allow new calls to schedule_read if we received some data --> set last arg accordingly
+                    self.incoming_data_handler([NSData dataWithBytes:buffer length:buffer_length], is_complete, nil, buffer_length > 0);
                     return buffer_length;
                 });
             });
@@ -248,7 +249,8 @@
                 NSError* st_error = nil;
                 if(receive_error)
                     st_error = (NSError*)CFBridgingRelease(nw_error_copy_cf_error(receive_error));
-                self.incoming_data_handler((NSData*)content, is_complete, st_error);
+                //we always want to allow new calls to schedule_read --> set last arg to YES
+                self.incoming_data_handler((NSData*)content, is_complete, st_error, YES);
             });
         }
     }
