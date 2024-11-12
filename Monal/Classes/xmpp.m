@@ -829,19 +829,21 @@ NSString* const kStanza = @"stanza";
     //this operation has highest priority to make sure it will be executed first once unfrozen
     NSBlockOperation* unfreezeOperation  = [NSBlockOperation blockOperationWithBlock:^{
         //this has to be the very first thing even before unfreezing the parse or send queues
-        if(self.accountState < kStateReconnecting)
-        {
-            DDLogInfo(@"Reloading UNfrozen account %@", self.accountNo);
-            //(re)read persisted state (could be changed by appex)
-            [self readState];
+        @synchronized(self->_stateLockObject) {
+            if(self.accountState < kStateReconnecting)
+            {
+                DDLogInfo(@"Reloading UNfrozen account %@", self.accountNo);
+                //(re)read persisted state (could be changed by appex)
+                [self readState];
+            }
+            else
+                DDLogInfo(@"Not reloading UNfrozen account %@, already connected", self.accountNo);
+            
+            //this must be inside the dispatch async, because it will dispatch *SYNC* to the receive queue and potentially block or even deadlock the system
+            [self unfreezeParseQueue];
+            
+            [self unfreezeSendQueue];
         }
-        else
-            DDLogInfo(@"Not reloading UNfrozen account %@, already connected", self.accountNo);
-        
-        //this must be inside the dispatch async, because it will dispatch *SYNC* to the receive queue and potentially block or even deadlock the system
-        [self unfreezeParseQueue];
-        
-        [self unfreezeSendQueue];
     }];
     unfreezeOperation.queuePriority = NSOperationQueuePriorityVeryHigh;     //make sure this will become the first operation executed once unfrozen
     [self->_receiveQueue addOperations: @[unfreezeOperation] waitUntilFinished:NO];
@@ -962,11 +964,67 @@ NSString* const kStanza = @"stanza";
 -(void) disconnectWithStreamError:(MLXMLNode* _Nullable) streamError andExplicitLogout:(BOOL) explicitLogout 
 {
     DDLogInfo(@"disconnect called...");
+    //commonly used by shortcut outside of receive queue and called from inside the receive queue, too
+    monal_void_block_t doExplicitLogout = ^{
+        @synchronized(self->_stateLockObject) {
+            DDLogVerbose(@"explicitLogout == YES --> clearing state");
+            
+            //preserve unAckedStanzas even on explicitLogout and resend them on next connect
+            //if we don't do this, messages could get lost when logging out directly after sending them
+            //and: sending messages twice is less intrusive than silently loosing them
+            NSMutableArray* stanzas = self.unAckedStanzas;
+
+            //reset smacks state to sane values (this can be done even if smacks is not supported)
+            [self initSM3];
+            self.unAckedStanzas = stanzas;
+            
+            //inform all old iq handlers of invalidation and clear _iqHandlers dictionary afterwards
+            @synchronized(self->_iqHandlers) {
+                for(NSString* iqid in [self->_iqHandlers allKeys])
+                {
+                    DDLogWarn(@"Invalidating iq handler for iq id '%@'", iqid);
+                    if(self->_iqHandlers[iqid][@"handler"] != nil)
+                        $invalidate(self->_iqHandlers[iqid][@"handler"], $ID(account, self), $ID(reason, @"disconnect"));
+                    else if(self->_iqHandlers[iqid][@"errorHandler"])
+                        ((monal_iq_handler_t)self->_iqHandlers[iqid][@"errorHandler"])(nil);
+                }
+                self->_iqHandlers = [NSMutableDictionary new];
+            }
+            
+            //invalidate pubsub queue (*after* iq handlers that also might invalidate a result handler of the queued operation)
+            [self.pubsub invalidateQueue];
+            
+            //clear pipeline cache
+            self->_pipeliningState = kPipelinedNothing;
+            self->_cachedStreamFeaturesBeforeAuth = nil;
+            self->_cachedStreamFeaturesAfterAuth = nil;
+            
+            //clear all reconnection handlers
+            @synchronized(self->_reconnectionHandlers) {
+                [self->_reconnectionHandlers removeAllObjects];
+            }
+
+            //persist these changes
+            [self persistState];
+        }
+        
+        [[DataLayer sharedInstance] resetContactsForAccount:self.accountNo];
+        
+        //trigger view updates to make sure enabled/disabled account state propagates to all ui elements
+        [[MLNotificationQueue currentQueue] postNotificationName:kMonalRefresh object:nil userInfo:nil];
+    };
     
     //short-circuit common case without dispatching to receive queue
     //this allows calling a noop disconnect while the receive queue is frozen
-    if(self->_accountState<kStateReconnecting && !explicitLogout)
+    //every change to our state is locked by our _stateLockObject and the receive queue unfreeze uses this lock, too
+    //--> an unfreeze can not happen half way through this explicit logout and therefore can't corrupt any state
+    //--> an unfreeze is needed to dispatch to the receive queue which is used by our connect method
+    if(self->_accountState<kStateReconnecting)
+    {
+        if(explicitLogout)
+            doExplicitLogout();
         return;
+    }
     
     MLAssert(!_receiveQueue.suspended, @"receive queue suspended while trying to disconnect!");
     
@@ -996,54 +1054,7 @@ NSString* const kStanza = @"stanza";
         {
             DDLogVerbose(@"not doing logout because already logged out, but clearing state if explicitLogout was yes");
             if(explicitLogout)
-            {
-                @synchronized(self->_stateLockObject) {
-                    DDLogVerbose(@"explicitLogout == YES --> clearing state");
-                    
-                    //preserve unAckedStanzas even on explicitLogout and resend them on next connect
-                    //if we don't do this, messages could get lost when logging out directly after sending them
-                    //and: sending messages twice is less intrusive than silently loosing them
-                    NSMutableArray* stanzas = self.unAckedStanzas;
-
-                    //reset smacks state to sane values (this can be done even if smacks is not supported)
-                    [self initSM3];
-                    self.unAckedStanzas = stanzas;
-                    
-                    //inform all old iq handlers of invalidation and clear _iqHandlers dictionary afterwards
-                    @synchronized(self->_iqHandlers) {
-                        for(NSString* iqid in [self->_iqHandlers allKeys])
-                        {
-                            DDLogWarn(@"Invalidating iq handler for iq id '%@'", iqid);
-                            if(self->_iqHandlers[iqid][@"handler"] != nil)
-                                $invalidate(self->_iqHandlers[iqid][@"handler"], $ID(account, self), $ID(reason, @"disconnect"));
-                            else if(self->_iqHandlers[iqid][@"errorHandler"])
-                                ((monal_iq_handler_t)self->_iqHandlers[iqid][@"errorHandler"])(nil);
-                        }
-                        self->_iqHandlers = [NSMutableDictionary new];
-                    }
-                    
-                    //invalidate pubsub queue (*after* iq handlers that also might invalidate a result handler of the queued operation)
-                    [self.pubsub invalidateQueue];
-                    
-                    //clear pipeline cache
-                    self->_pipeliningState = kPipelinedNothing;
-                    self->_cachedStreamFeaturesBeforeAuth = nil;
-                    self->_cachedStreamFeaturesAfterAuth = nil;
-                    
-                    //clear all reconnection handlers
-                    @synchronized(self->_reconnectionHandlers) {
-                        [self->_reconnectionHandlers removeAllObjects];
-                    }
-
-                    //persist these changes
-                    [self persistState];
-                }
-                
-                [[DataLayer sharedInstance] resetContactsForAccount:self.accountNo];
-                
-                //trigger view updates to make sure enabled/disabled account state propagates to all ui elements
-                [[MLNotificationQueue currentQueue] postNotificationName:kMonalRefresh object:nil userInfo:nil];
-            }
+                doExplicitLogout();
             return;
         }
         DDLogInfo(@"disconnecting");
